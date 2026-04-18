@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>饮食体重记录</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="background-glow background-glow-left"></div>
+    <div class="background-glow background-glow-right"></div>
+
+    <main class="page-shell">
+      <section class="hero-panel">
+        <div>
+          <p class="eyebrow">Daily Nutrition Journal</p>
+          <h1>饮食与体重记录</h1>
+          <p class="hero-copy">
+            每天记下你吃了什么、摄入了多少热量，再把体重变化实时画成曲线。手机和电脑都能打开，记录不会丢。
+          </p>
+        </div>
+        <div class="hero-actions">
+          <div class="session-card">
+            <div>
+              <p class="session-label">访问状态</p>
+              <strong id="sessionStatus">正在检查登录状态</strong>
+              <small id="sessionMeta">准备连接数据服务</small>
+            </div>
+            <button id="logoutButton" class="ghost-button hidden" type="button">退出登录</button>
+          </div>
+
+          <label class="field">
+            <span>查看日期</span>
+            <input id="selectedDate" type="date" />
+          </label>
+
+          <div class="range-tabs" id="rangeTabs">
+            <button class="tab-button is-active" data-days="14" type="button">14 天</button>
+            <button class="tab-button" data-days="30" type="button">30 天</button>
+            <button class="tab-button" data-days="90" type="button">90 天</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="summary-grid" id="summaryCards">
+        <article class="summary-card accent-orange">
+          <span>今日热量</span>
+          <strong id="todayCalories">0 kcal</strong>
+          <small id="mealCountText">0 条饮食记录</small>
+        </article>
+        <article class="summary-card accent-green">
+          <span>今日体重</span>
+          <strong id="todayWeight">未记录</strong>
+          <small id="latestWeightText">暂无体重历史</small>
+        </article>
+        <article class="summary-card accent-blue">
+          <span>近 7 天平均热量</span>
+          <strong id="weeklyCalories">0 kcal</strong>
+          <small>帮助你看清饮食趋势</small>
+        </article>
+        <article class="summary-card accent-sand">
+          <span>近 7 天体重变化</span>
+          <strong id="weeklyWeightDelta">暂无</strong>
+          <small id="rangeWeightDelta">观察长期变化更稳</small>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <section class="panel card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Food Log</p>
+              <h2>记录饮食</h2>
+            </div>
+          </div>
+
+          <form id="mealForm" class="stacked-form">
+            <div class="field food-search-field">
+              <label for="foodQuery">食物名称</label>
+              <input
+                id="foodQuery"
+                type="text"
+                autocomplete="off"
+                placeholder="输入食物名，例如 鸡胸肉、米饭、奶茶"
+              />
+              <div class="suggestion-box hidden" id="foodSuggestions"></div>
+            </div>
+
+            <div class="form-toggle-row">
+              <label class="checkbox-row">
+                <input id="manualMode" type="checkbox" />
+                <span>没搜到食物时，手动填写热量</span>
+              </label>
+              <div id="foodBasisHint" class="basis-hint">先搜索并选择一个食物</div>
+            </div>
+
+            <div class="form-grid">
+              <label class="field">
+                <span>餐次</span>
+                <select id="mealType">
+                  <option value="早餐">早餐</option>
+                  <option value="午餐">午餐</option>
+                  <option value="晚餐">晚餐</option>
+                  <option value="加餐">加餐</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>食用量</span>
+                <input id="mealAmount" type="number" min="0" step="0.1" placeholder="例如 150" />
+              </label>
+
+              <label class="field">
+                <span>单位</span>
+                <input id="mealUnit" type="text" readonly />
+              </label>
+            </div>
+
+            <div class="manual-grid hidden" id="manualFields">
+              <label class="field">
+                <span>参考热量（kcal）</span>
+                <input id="manualCalories" type="number" min="0" step="0.1" placeholder="例如 116" />
+              </label>
+
+              <label class="field">
+                <span>基准量</span>
+                <input id="manualBasisAmount" type="number" min="0" step="0.1" placeholder="例如 100" />
+              </label>
+
+              <label class="field">
+                <span>基准单位</span>
+                <input id="manualBasisUnit" type="text" placeholder="例如 g / ml / 个 / 份" />
+              </label>
+            </div>
+
+            <label class="checkbox-row hidden" id="saveFoodRow">
+              <input id="saveCustomFood" type="checkbox" />
+              <span>把这条手动热量保存为常用食物</span>
+            </label>
+
+            <label class="field">
+              <span>备注</span>
+              <input id="mealNote" type="text" placeholder="例如 少油、半糖、训练后" />
+            </label>
+
+            <div class="estimate-box">
+              <span>预计摄入</span>
+              <strong id="calorieEstimate">0 kcal</strong>
+            </div>
+
+            <button class="primary-button" type="submit">保存这顿饮食</button>
+          </form>
+        </section>
+
+        <section class="panel card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Weight Log</p>
+              <h2>记录体重</h2>
+            </div>
+          </div>
+
+          <form id="weightForm" class="stacked-form">
+            <div class="form-grid">
+              <label class="field">
+                <span>体重（kg）</span>
+                <input id="weightValue" type="number" min="0" step="0.1" placeholder="例如 63.5" />
+              </label>
+
+              <label class="field">
+                <span>备注</span>
+                <input id="weightNote" type="text" placeholder="例如 早起空腹" />
+              </label>
+            </div>
+
+            <button class="secondary-button" type="submit">保存今日体重</button>
+          </form>
+
+          <div class="recent-weight-list">
+            <div class="subheading-row">
+              <h3>最近体重</h3>
+            </div>
+            <div id="recentWeights" class="list-shell empty-state">还没有体重记录</div>
+          </div>
+        </section>
+      </section>
+
+      <section class="content-grid">
+        <section class="panel card chart-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Weight Curve</p>
+              <h2>体重曲线</h2>
+            </div>
+          </div>
+          <div id="weightChart" class="chart-shell empty-state">添加几条体重后，这里会自动生成曲线</div>
+        </section>
+
+        <section class="panel card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Daily Meals</p>
+              <h2>当日饮食</h2>
+            </div>
+          </div>
+          <div id="mealBreakdown" class="pill-row"></div>
+          <div id="mealList" class="meal-list empty-state">这一天还没有饮食记录</div>
+        </section>
+      </section>
+
+      <div id="toast" class="toast hidden"></div>
+    </main>
+
+    <section id="authOverlay" class="auth-overlay hidden">
+      <div class="auth-card">
+        <p class="eyebrow">Secure Access</p>
+        <h2>登录后继续记录</h2>
+        <p class="auth-copy">
+          这个云端版本已经开启登录保护，只有输入你的账号和密码后，才能查看和修改饮食、热量与体重数据。
+        </p>
+
+        <form id="loginForm" class="stacked-form auth-form">
+          <label class="field">
+            <span>账号</span>
+            <input id="loginUsername" type="text" autocomplete="username" placeholder="例如 admin" />
+          </label>
+
+          <label class="field">
+            <span>密码</span>
+            <input
+              id="loginPassword"
+              type="password"
+              autocomplete="current-password"
+              placeholder="输入 Render 上配置的密码"
+            />
+          </label>
+
+          <p id="authMessage" class="auth-message">登录后会自动加载你的饮食和体重数据。</p>
+          <button class="primary-button" type="submit">登录</button>
+        </form>
+      </div>
+    </section>
+
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>
