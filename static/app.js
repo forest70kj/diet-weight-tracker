@@ -9,6 +9,18 @@ const state = {
   username: "",
 };
 
+const registerServiceWorker = async () => {
+  if (!("serviceWorker" in navigator)) {
+    return;
+  }
+
+  try {
+    await navigator.serviceWorker.register("/sw.js");
+  } catch (error) {
+    console.error("Service worker register failed", error);
+  }
+};
+
 const refs = {
   selectedDate: document.querySelector("#selectedDate"),
   rangeTabs: document.querySelector("#rangeTabs"),
@@ -671,6 +683,7 @@ const bindEvents = () => {
 };
 
 const init = async () => {
+  await registerServiceWorker();
   bindEvents();
   updateManualMode();
 

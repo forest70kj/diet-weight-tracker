@@ -943,6 +943,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
         self.serve_static(parsed.path)
 
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        self.serve_static(parsed.path, send_body=False)
+
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
 
@@ -1043,9 +1047,13 @@ class AppHandler(BaseHTTPRequestHandler):
 
         error_response(self, "未找到接口", status=404)
 
-    def serve_static(self, raw_path: str) -> None:
+    def serve_static(self, raw_path: str, send_body: bool = True) -> None:
         if raw_path in ("", "/"):
             relative_path = "index.html"
+        elif raw_path == "/sw.js":
+            relative_path = "sw.js"
+        elif raw_path == "/favicon.ico":
+            relative_path = "icons/favicon-192.png"
         elif raw_path.startswith("/static/"):
             relative_path = raw_path.removeprefix("/static/")
         else:
@@ -1061,12 +1069,15 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         mime_type, _ = mimetypes.guess_type(str(file_path))
+        if file_path.suffix == ".webmanifest":
+            mime_type = "application/manifest+json"
         body = file_path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{mime_type or 'application/octet-stream'}; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if send_body:
+            self.wfile.write(body)
 
     def log_message(self, format: str, *args) -> None:
         return
