@@ -9,6 +9,7 @@
 
 - 记录每天吃了什么、吃了多少
 - 内置常见食物热量库，可搜索后自动计算卡路里
+- 本地没搜到时，会自动联网到 Open Food Facts 补查热量，并缓存结果减少重复查询
 - 支持手动输入热量并保存为自定义常用食物
 - 记录每日体重，自动覆盖同一天的旧记录
 - 自动生成近 `14 / 30 / 90` 天体重曲线
@@ -99,6 +100,7 @@ admin
 - `SESSION_SECRET`：会话签名密钥，蓝图里自动生成
 - `AUTH_REQUIRED`：是否强制登录，Render 默认为 `true`
 - `FORCE_SECURE_COOKIE`：线上使用安全 Cookie，默认为 `true`
+- `REMOTE_FOOD_LOOKUP_ENABLED`：是否开启联网食物热量补查，默认 `true`
 
 ## 关于 Render 免费版
 

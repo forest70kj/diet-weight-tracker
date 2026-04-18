@@ -3,6 +3,7 @@ const state = {
   days: 14,
   foods: [],
   selectedFood: null,
+  foodSearchToken: 0,
   manualMode: false,
   authRequired: false,
   authenticated: false,
@@ -28,6 +29,7 @@ const refs = {
   weightForm: document.querySelector("#weightForm"),
   foodQuery: document.querySelector("#foodQuery"),
   foodSuggestions: document.querySelector("#foodSuggestions"),
+  foodSearchMeta: document.querySelector("#foodSearchMeta"),
   foodBasisHint: document.querySelector("#foodBasisHint"),
   mealType: document.querySelector("#mealType"),
   mealAmount: document.querySelector("#mealAmount"),
@@ -92,6 +94,14 @@ const formatDateLabel = (dateString) => {
   return `${date.getMonth() + 1}/${date.getDate()}`;
 };
 
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+
 const showToast = (message, isError = false) => {
   refs.toast.textContent = message;
   refs.toast.classList.remove("hidden", "toast-error");
@@ -108,6 +118,11 @@ const showToast = (message, isError = false) => {
 const setAuthMessage = (message, isError = false) => {
   refs.authMessage.textContent = message;
   refs.authMessage.classList.toggle("auth-message-error", isError);
+};
+
+const setFoodSearchMeta = (message, isError = false) => {
+  refs.foodSearchMeta.textContent = message;
+  refs.foodSearchMeta.classList.toggle("search-meta-error", isError);
 };
 
 const updateAuthUI = (session) => {
@@ -186,8 +201,12 @@ const renderFoodSuggestions = (foods) => {
     .map(
       (food) => `
         <button class="suggestion-item" type="button" data-food-id="${food.id}">
-          <span>${food.name}</span>
-          <small>${formatNumber(food.calories, 0)} kcal / ${formatNumber(food.basis_amount)} ${food.basis_unit}</small>
+          <div class="suggestion-copy">
+            <span>${escapeHtml(food.name)}</span>
+            <small>${escapeHtml(food.source_label || "本地")} · ${formatNumber(food.calories, 0)} kcal / ${formatNumber(
+        food.basis_amount
+      )} ${escapeHtml(food.basis_unit)}</small>
+          </div>
         </button>
       `
     )
@@ -208,6 +227,7 @@ const updateFoodSelection = (food) => {
   refs.manualBasisAmount.value = food.basis_amount;
   refs.manualBasisUnit.value = food.basis_unit;
   refs.foodSuggestions.classList.add("hidden");
+  setFoodSearchMeta(`已选中${food.source_label || "本地"}热量结果，直接填写食用量就可以。`);
   updateCalorieEstimate();
 };
 
@@ -215,6 +235,9 @@ const clearFoodSelection = () => {
   state.selectedFood = null;
   refs.foodBasisHint.textContent = state.manualMode ? "手动填写热量基准后即可计算" : "先搜索并选择一个食物";
   refs.mealUnit.value = state.manualMode ? refs.manualBasisUnit.value : "";
+  if (!refs.foodQuery.value.trim()) {
+    setFoodSearchMeta("可先搜常见食物，本地没找到时会自动联网补查热量。");
+  }
   updateCalorieEstimate();
 };
 
@@ -227,8 +250,10 @@ const updateManualMode = () => {
     refs.foodSuggestions.classList.add("hidden");
     refs.foodBasisHint.textContent = "手动填写热量基准后即可计算";
     refs.mealUnit.value = refs.manualBasisUnit.value;
+    setFoodSearchMeta("已切到手动热量模式。取消勾选后，也可以继续自动联网查热量。");
   } else {
     refs.saveCustomFood.checked = false;
+    setFoodSearchMeta("可先搜常见食物，本地没找到时会自动联网补查热量。");
     clearFoodSelection();
   }
   updateCalorieEstimate();
@@ -257,16 +282,59 @@ const updateCalorieEstimate = () => {
 };
 
 const searchFoods = debounce(async (query) => {
+  const requestId = ++state.foodSearchToken;
   if (state.manualMode || (state.authRequired && !state.authenticated)) {
     return;
   }
+
+  const trimmedQuery = query.trim();
+
   try {
-    const payload = await api(`/api/foods?query=${encodeURIComponent(query)}`);
-    renderFoodSuggestions(payload.foods || []);
+    const localPayload = await api(`/api/foods?query=${encodeURIComponent(trimmedQuery)}`);
+    if (requestId !== state.foodSearchToken) {
+      return;
+    }
+
+    renderFoodSuggestions(localPayload.foods || []);
+    if (localPayload.foods?.length) {
+      setFoodSearchMeta("");
+      return;
+    }
+
+    if (!trimmedQuery) {
+      setFoodSearchMeta("可先搜常见食物，本地没找到时会自动联网补查热量。");
+      return;
+    }
+
+    if (trimmedQuery.length < 2) {
+      setFoodSearchMeta(localPayload.message || "再多输几个字，我会自动联网补查热量。");
+      return;
+    }
+
+    setFoodSearchMeta("本地没找到，正在联网补查热量...");
+    const remotePayload = await api(
+      `/api/foods?query=${encodeURIComponent(trimmedQuery)}&allow_remote=1`
+    );
+    if (requestId !== state.foodSearchToken) {
+      return;
+    }
+
+    renderFoodSuggestions(remotePayload.foods || []);
+    setFoodSearchMeta(
+      remotePayload.message ||
+        ((remotePayload.foods || []).length
+          ? "已联网找到食物热量。"
+          : "本地和网络都没找到，先切到手动热量模式也可以。"),
+      remotePayload.source === "remote_error"
+    );
   } catch (error) {
+    if (requestId !== state.foodSearchToken) {
+      return;
+    }
+    setFoodSearchMeta("联网查询失败了，你也可以先切到手动热量模式。", true);
     showToast(error.message, true);
   }
-}, 220);
+}, 260);
 
 const renderBreakdown = (breakdown) => {
   if (!breakdown.length) {
@@ -302,12 +370,12 @@ const renderMeals = (meals) => {
             <div>
               <div class="meal-title-row">
                 <span class="meal-type-badge">${meal.meal_type}</span>
-                <strong>${meal.food_name}</strong>
+                <strong>${escapeHtml(meal.food_name)}</strong>
               </div>
               <p>${formatNumber(meal.amount)} ${meal.basis_unit} · ${formatNumber(meal.total_calories, 0)} kcal</p>
               ${
                 meal.note
-                  ? `<p class="meal-note">${meal.note}</p>`
+                  ? `<p class="meal-note">${escapeHtml(meal.note)}</p>`
                   : `<p class="meal-note muted">无备注</p>`
               }
             </div>
@@ -333,7 +401,7 @@ const renderRecentWeights = (weights) => {
         <div class="list-row">
           <div>
             <strong>${formatNumber(item.weight)} kg</strong>
-            <p>${item.record_date}${item.note ? ` · ${item.note}` : ""}</p>
+            <p>${item.record_date}${item.note ? ` · ${escapeHtml(item.note)}` : ""}</p>
           </div>
           <button class="ghost-button" type="button" data-delete-weight="${item.record_date}">删除</button>
         </div>
@@ -519,6 +587,7 @@ const resetMealForm = () => {
   refs.manualMode.checked = false;
   updateManualMode();
   clearFoodSelection();
+  setFoodSearchMeta("可先搜常见食物，本地没找到时会自动联网补查热量。");
 };
 
 const handleMealSubmit = async (event) => {

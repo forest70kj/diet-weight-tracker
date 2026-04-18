@@ -307,8 +307,7 @@ select:focus {
 
 .suggestion-item {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: flex-start;
   gap: 12px;
   width: 100%;
   padding: 12px 14px;
@@ -320,13 +319,35 @@ select:focus {
   transition: transform 140ms ease, background 140ms ease;
 }
 
+.suggestion-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.suggestion-copy span {
+  font-weight: 600;
+}
+
 .suggestion-item:hover {
   transform: translateY(-1px);
   background: white;
 }
 
 .suggestion-item small {
+  display: block;
   color: var(--muted);
+}
+
+.search-meta {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.search-meta-error {
+  color: var(--danger);
 }
 
 .form-toggle-row {

@@ -7,6 +7,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import socket
 import sqlite3
@@ -20,7 +21,9 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 try:
     import psycopg
@@ -64,6 +67,47 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
 if AUTH_REQUIRED and not SESSION_SECRET:
     SESSION_SECRET = secrets.token_urlsafe(48)
 
+REMOTE_FOOD_PROVIDER = "Open Food Facts"
+REMOTE_FOOD_LOOKUP_ENABLED = env_bool("REMOTE_FOOD_LOOKUP_ENABLED", default=True)
+REMOTE_FOOD_SEARCH_URL = os.environ.get(
+    "REMOTE_FOOD_SEARCH_URL",
+    "https://search.openfoodfacts.org/search",
+).strip()
+REMOTE_FOOD_LOOKUP_LANGS = os.environ.get("REMOTE_FOOD_LOOKUP_LANGS", "zh,en").strip() or "zh,en"
+REMOTE_FOOD_MIN_QUERY_LENGTH = max(
+    2,
+    int(os.environ.get("REMOTE_FOOD_MIN_QUERY_LENGTH", "2")),
+)
+REMOTE_FOOD_PAGE_SIZE = min(
+    max(int(os.environ.get("REMOTE_FOOD_PAGE_SIZE", "6")), 1),
+    8,
+)
+REMOTE_FOOD_FETCH_SIZE = min(max(REMOTE_FOOD_PAGE_SIZE * 4, 12), 24)
+REMOTE_FOOD_CACHE_TTL_SECONDS = max(
+    3600,
+    int(os.environ.get("REMOTE_FOOD_CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60))),
+)
+REMOTE_FOOD_LOOKUP_TIMEOUT_SECONDS = max(
+    3,
+    int(os.environ.get("REMOTE_FOOD_LOOKUP_TIMEOUT_SECONDS", "12")),
+)
+REMOTE_FOOD_USER_AGENT = os.environ.get(
+    "REMOTE_FOOD_USER_AGENT",
+    "diet-weight-tracker/1.0 (+https://github.com/forest70kj/diet-weight-tracker)",
+).strip()
+REMOTE_QUERY_VARIANT_MAP = {
+    "奥利奥": ["oreo"],
+    "可口可乐": ["coca cola", "coke"],
+    "百事可乐": ["pepsi"],
+    "士力架": ["snickers"],
+    "奇巧": ["kitkat", "kit kat"],
+    "乐事": ["lays", "potato chips"],
+    "m豆": ["m&m", "m and m"],
+    "蛋白棒": ["protein bar"],
+    "蛋白粉": ["protein powder"],
+    "鸡胸肉": ["chicken breast"],
+}
+
 
 def utc_now() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -75,6 +119,10 @@ def iso_today() -> str:
 
 def parse_date(value: str) -> str:
     return date.fromisoformat(value).isoformat()
+
+
+def parse_utc_timestamp(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_lan_ip() -> str:
@@ -229,9 +277,18 @@ def init_db() -> None:
             updated_at TEXT NOT NULL
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS food_lookup_cache (
+            query_key TEXT PRIMARY KEY,
+            query_text TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS idx_meals_record_date ON meals(record_date)",
         "CREATE INDEX IF NOT EXISTS idx_meals_created_at ON meals(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_weights_record_date ON weights(record_date)",
+        "CREATE INDEX IF NOT EXISTS idx_food_lookup_cache_fetched_at ON food_lookup_cache(fetched_at)",
     ]
 
     postgres_statements = [
@@ -269,9 +326,18 @@ def init_db() -> None:
             updated_at TEXT NOT NULL
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS food_lookup_cache (
+            query_key TEXT PRIMARY KEY,
+            query_text TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS idx_meals_record_date ON meals(record_date)",
         "CREATE INDEX IF NOT EXISTS idx_meals_created_at ON meals(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_weights_record_date ON weights(record_date)",
+        "CREATE INDEX IF NOT EXISTS idx_food_lookup_cache_fetched_at ON food_lookup_cache(fetched_at)",
     ]
 
     statements = postgres_statements if USING_POSTGRES else sqlite_statements
@@ -312,7 +378,14 @@ def read_json_body(handler: BaseHTTPRequestHandler) -> dict:
         raise ValueError("请求体不是有效的 JSON") from exc
 
 
-def serialize_food(row) -> dict:
+def serialize_food(
+    row,
+    *,
+    source: str = "local",
+    source_label: str = "本地",
+    brand: str = "",
+    source_detail: str = "常用食物库",
+) -> dict:
     return {
         "id": row["id"],
         "name": row["name"],
@@ -321,6 +394,10 @@ def serialize_food(row) -> dict:
         "basis_amount": row["basis_amount"],
         "basis_unit": row["basis_unit"],
         "aliases": row["aliases"],
+        "source": source,
+        "source_label": source_label,
+        "brand": brand,
+        "source_detail": source_detail,
     }
 
 
@@ -370,7 +447,94 @@ def calculate_total_calories(amount: float, basis_amount: float, calories: float
     return format_decimal((amount / basis_amount) * calories)
 
 
-def get_foods(query: str) -> list[dict]:
+def normalize_food_query(query: str) -> str:
+    return " ".join(str(query).split()).strip().lower()
+
+
+def parse_optional_float(value: object) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return format_decimal(number)
+
+
+def join_brands(value: object) -> str:
+    if isinstance(value, list):
+        brands = [str(item).strip() for item in value if str(item).strip()]
+        return " / ".join(brands)
+    return str(value or "").strip()
+
+
+def merge_aliases(*values: object) -> str:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "")
+        text = re.sub(r"[，,、/]+", " ", text)
+        for chunk in text.split():
+            token = chunk.strip()
+            if not token:
+                continue
+            token_key = token.lower()
+            if token_key in seen:
+                continue
+            seen.add(token_key)
+            aliases.append(token)
+    return " ".join(aliases)
+
+
+def infer_basis_unit(quantity: str, serving_unit: str = "") -> str:
+    sample = f"{quantity} {serving_unit}".lower()
+    if any(keyword in sample for keyword in ("ml", "毫升", " l", "升")):
+        return "ml"
+    return "g"
+
+
+def remote_result_matches_query(query: str, *values: object) -> bool:
+    query_key = normalize_food_query(query)
+    searchable_text = normalize_food_query(" ".join(str(value or "") for value in values))
+    if not query_key or not searchable_text:
+        return False
+
+    compact_query = query_key.replace(" ", "")
+    compact_text = searchable_text.replace(" ", "")
+    if compact_query and compact_query in compact_text:
+        return True
+
+    tokens = [token for token in query_key.split() if token]
+    if not tokens:
+        return False
+
+    non_cjk_tokens = [
+        token
+        for token in tokens
+        if not any("\u4e00" <= character <= "\u9fff" for character in token)
+    ]
+    comparable_tokens = [token for token in non_cjk_tokens if len(token) > 1] or non_cjk_tokens
+    if not comparable_tokens:
+        return False
+
+    return all(token in searchable_text for token in comparable_tokens)
+
+
+def build_remote_query_variants(query: str) -> list[str]:
+    trimmed_query = query.strip()
+    if not trimmed_query:
+        return []
+
+    variants: list[str] = [trimmed_query]
+    mapped_variants = REMOTE_QUERY_VARIANT_MAP.get(trimmed_query, [])
+    for variant in mapped_variants:
+        candidate = variant.strip()
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def get_local_foods(query: str) -> list[dict]:
     like_operator = "ILIKE" if USING_POSTGRES else "LIKE"
     like = f"%{query.strip()}%"
 
@@ -405,6 +569,263 @@ def get_foods(query: str) -> list[dict]:
                 """,
             ).fetchall()
     return [serialize_food(row) for row in rows]
+
+
+def load_cached_remote_foods(query: str) -> Optional[list[dict]]:
+    query_key = normalize_food_query(query)
+    if not query_key:
+        return None
+
+    with get_connection() as connection:
+        row = execute(
+            connection,
+            """
+            SELECT results_json, fetched_at
+            FROM food_lookup_cache
+            WHERE query_key = ?
+            """,
+            (query_key,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    try:
+        fetched_at = parse_utc_timestamp(row["fetched_at"])
+    except (TypeError, ValueError):
+        return None
+
+    if (datetime.utcnow() - fetched_at).total_seconds() > REMOTE_FOOD_CACHE_TTL_SECONDS:
+        return None
+
+    try:
+        cached_foods = json.loads(row["results_json"])
+    except json.JSONDecodeError:
+        return None
+
+    foods: list[dict] = []
+    raw_count = 0
+    for food in cached_foods:
+        if not isinstance(food, dict):
+            continue
+        raw_count += 1
+        if not remote_result_matches_query(
+            query,
+            food.get("name", ""),
+            food.get("aliases", ""),
+            food.get("brand", ""),
+        ):
+            continue
+        restored = dict(food)
+        restored["source"] = "remote_cache"
+        restored["source_label"] = "联网缓存"
+        restored["source_detail"] = REMOTE_FOOD_PROVIDER
+        foods.append(restored)
+    if raw_count and not foods:
+        return None
+    return foods
+
+
+def save_remote_food_cache(query: str, foods: list[dict]) -> None:
+    query_key = normalize_food_query(query)
+    if not query_key:
+        return
+
+    with get_connection() as connection:
+        execute(
+            connection,
+            """
+            INSERT INTO food_lookup_cache (query_key, query_text, results_json, fetched_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(query_key) DO UPDATE SET
+                query_text = excluded.query_text,
+                results_json = excluded.results_json,
+                fetched_at = excluded.fetched_at
+            """,
+            (
+                query_key,
+                query.strip(),
+                json.dumps(foods, ensure_ascii=False),
+                utc_now(),
+            ),
+        )
+
+
+def extract_remote_food_basis(product: dict) -> Optional[dict]:
+    nutriments = product.get("nutriments") or {}
+    quantity = str(product.get("quantity", "")).strip()
+    serving_unit = str(product.get("serving_quantity_unit", "")).strip()
+    basis_unit = infer_basis_unit(quantity, serving_unit)
+
+    kcal_per_100 = parse_optional_float(
+        nutriments.get("energy-kcal_100g") or nutriments.get("energy-kcal")
+    )
+    if kcal_per_100:
+        return {
+            "calories": kcal_per_100,
+            "basis_amount": 100.0,
+            "basis_unit": basis_unit,
+        }
+
+    energy_per_100 = parse_optional_float(
+        nutriments.get("energy_100g") or nutriments.get("energy")
+    )
+    if energy_per_100:
+        return {
+            "calories": format_decimal(energy_per_100 / 4.184),
+            "basis_amount": 100.0,
+            "basis_unit": basis_unit,
+        }
+
+    serving_amount = parse_optional_float(product.get("serving_quantity"))
+    kcal_per_serving = parse_optional_float(nutriments.get("energy-kcal_serving"))
+    if kcal_per_serving and serving_amount:
+        return {
+            "calories": kcal_per_serving,
+            "basis_amount": serving_amount,
+            "basis_unit": serving_unit or basis_unit,
+        }
+
+    energy_per_serving = parse_optional_float(nutriments.get("energy_serving"))
+    if energy_per_serving and serving_amount:
+        return {
+            "calories": format_decimal(energy_per_serving / 4.184),
+            "basis_amount": serving_amount,
+            "basis_unit": serving_unit or basis_unit,
+        }
+
+    return None
+
+
+def normalize_remote_food(product: dict, query: str, query_variant: str, index: int) -> Optional[dict]:
+    raw_name = str(
+        product.get("product_name_zh")
+        or product.get("product_name")
+        or product.get("product_name_en")
+        or ""
+    ).strip()
+    if not raw_name:
+        return None
+
+    basis = extract_remote_food_basis(product)
+    if not basis:
+        return None
+
+    brand = join_brands(product.get("brands"))
+    if not remote_result_matches_query(query_variant, raw_name, brand):
+        return None
+
+    display_name = raw_name
+    if brand and brand.lower() not in raw_name.lower():
+        display_name = f"{raw_name}（{brand}）"
+
+    return {
+        "id": f"remote:{normalize_food_query(query).replace(' ', '-') or 'food'}:{index}",
+        "name": display_name,
+        "category": "联网查询",
+        "calories": basis["calories"],
+        "basis_amount": basis["basis_amount"],
+        "basis_unit": basis["basis_unit"],
+        "aliases": merge_aliases(query, query_variant, raw_name, brand),
+        "source": "remote",
+        "source_label": "联网",
+        "brand": brand,
+        "source_detail": REMOTE_FOOD_PROVIDER,
+    }
+
+
+def fetch_remote_foods(query: str) -> list[dict]:
+    remote_foods: list[dict] = []
+    seen_names: set[str] = set()
+    for query_variant in build_remote_query_variants(query):
+        params = urlencode(
+            {
+                "q": query_variant,
+                "langs": REMOTE_FOOD_LOOKUP_LANGS,
+                "page_size": REMOTE_FOOD_FETCH_SIZE,
+                "fields": (
+                    "product_name,product_name_zh,product_name_en,brands,nutriments,"
+                    "quantity,serving_quantity,serving_quantity_unit"
+                ),
+            }
+        )
+        url = f"{REMOTE_FOOD_SEARCH_URL}?{params}"
+        request = Request(
+            url,
+            headers={
+                "User-Agent": REMOTE_FOOD_USER_AGENT,
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=REMOTE_FOOD_LOOKUP_TIMEOUT_SECONDS) as response:
+                payload = json.load(response)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError("联网热量查询暂时不可用，请稍后再试或先手动填写。") from exc
+
+        hits = payload.get("hits") or payload.get("products") or []
+        for index, hit in enumerate(hits):
+            product = hit.get("product") if isinstance(hit, dict) else None
+            normalized = normalize_remote_food(product or hit, query, query_variant, index)
+            if not normalized:
+                continue
+            dedupe_key = normalize_food_query(normalized["name"])
+            if dedupe_key in seen_names:
+                continue
+            seen_names.add(dedupe_key)
+            remote_foods.append(normalized)
+            if len(remote_foods) >= REMOTE_FOOD_PAGE_SIZE:
+                return remote_foods
+    return remote_foods
+
+
+def get_foods(query: str, allow_remote: bool = False) -> dict:
+    trimmed_query = query.strip()
+    local_foods = get_local_foods(trimmed_query)
+    if local_foods:
+        return {"foods": local_foods, "source": "local", "message": ""}
+
+    if not trimmed_query:
+        return {"foods": [], "source": "none", "message": ""}
+
+    if (
+        not allow_remote
+        or not REMOTE_FOOD_LOOKUP_ENABLED
+        or len(trimmed_query) < REMOTE_FOOD_MIN_QUERY_LENGTH
+    ):
+        return {
+            "foods": [],
+            "source": "none",
+            "message": (
+                "再多输几个字，我会在本地没找到时自动联网补查热量。"
+                if len(trimmed_query) < REMOTE_FOOD_MIN_QUERY_LENGTH
+                else ""
+            ),
+        }
+
+    cached_foods = load_cached_remote_foods(trimmed_query)
+    if cached_foods is not None:
+        return {
+            "foods": cached_foods,
+            "source": "remote_cache",
+            "message": f"本地没找到，已从联网缓存里找到 {len(cached_foods)} 个结果。",
+        }
+
+    remote_foods = fetch_remote_foods(trimmed_query)
+    save_remote_food_cache(trimmed_query, remote_foods)
+    if remote_foods:
+        return {
+            "foods": remote_foods,
+            "source": "remote",
+            "message": f"本地没找到，已联网查到 {len(remote_foods)} 个结果。",
+        }
+
+    return {
+        "foods": [],
+        "source": "none",
+        "message": "本地和网络都没找到，先切到手动热量模式也可以。",
+    }
 
 
 def upsert_custom_food(
@@ -926,7 +1347,11 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/foods":
             query = parse_qs(parsed.query).get("query", [""])[0]
-            json_response(self, {"foods": get_foods(query)})
+            allow_remote = parse_qs(parsed.query).get("allow_remote", ["0"])[0].strip().lower()
+            json_response(
+                self,
+                get_foods(query, allow_remote=allow_remote in {"1", "true", "yes", "on"}),
+            )
             return
 
         if parsed.path == "/api/dashboard":
